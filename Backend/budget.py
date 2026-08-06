@@ -88,4 +88,3 @@ def evaluate_budget(summary):
         )
 
     return warnings
-}
