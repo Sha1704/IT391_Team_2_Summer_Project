@@ -1,10 +1,74 @@
-# route logout back to signup (and add the "you have logged out popup")
+import logging
+import os
+from logging.handlers import RotatingFileHandler
+
 from  flask import request, Flask, jsonify, url_for, redirect
 from flask_cors import CORS
 import user as user_file
 import kakeibo_ai
 import chat_history
+import chat_guard
 import expenses
+import budget
+import fee_monitor
+import purchase_rules
+
+
+# All backend logging lands in Backend/logs/app.log (rotated at ~1MB so it can
+# never grow without bound). The AI layer logs the real API exceptions here;
+# users only ever see the friendly one-liners.
+LOG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
+
+try:
+    os.makedirs(LOG_DIR, exist_ok=True)
+    _log_handler = RotatingFileHandler(os.path.join(LOG_DIR, "app.log"),
+                                       maxBytes=1_000_000, backupCount=3,
+                                       encoding="utf-8")
+except OSError:
+    # An unwritable app directory must not stop the app from booting -- losing
+    # the log file is survivable, taking login/signup down with it is not.
+    _log_handler = logging.StreamHandler()
+
+_log_handler.setFormatter(
+    logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
+logging.getLogger().addHandler(_log_handler)
+
+# Root stays at WARNING on purpose: httpx logs an INFO line for every Supabase
+# and OpenAI request (roughly six per /chat), which would push the AI tracebacks
+# -- the only record of what actually went wrong -- out of the rotation. Our own
+# loggers are turned up to INFO individually.
+logging.getLogger().setLevel(logging.WARNING)
+logging.getLogger("kakeibo").setLevel(logging.INFO)
+log = logging.getLogger("kakeibo.app")
+
+
+# Serving the frontend from Flask keeps everything on one origin, so the browser
+# is not making cross-origin calls to our own API.
+app = Flask(__name__, static_folder="../Frontend", static_url_path="")
+CORS(app) # change this to restrict endpoints later
+
+
+MAX_MESSAGE_CHARS = 1000      # "one paragraph"
+
+
+def get_caller():
+# Every chat/history endpoint starts the same way: who is this?
+# The frontend sends the access token it got from /login as
+#     Authorization: Bearer <token>
+# Returns (token, user_id), or (None, None) if the header is missing or the token
+# is not valid -- the endpoint turns that into a 401.
+    header = request.headers.get("Authorization", "")
+    if not header.startswith("Bearer "):
+        return (None, None)
+
+    token = header[len("Bearer "):].strip()
+    status = user_file.get_user_id(token)
+    # status returns a tuple (true or false depending on whether the token is good,
+    # the user id or an error message)
+    if not status[0]:
+        return (None, None)
+
+    return (token, status[1])
 
 app = Flask(__name__, static_folder="../Frontend", static_url_path="")
 CORS(app, origins=[
@@ -102,7 +166,7 @@ def chat():
 
     # Claims the slot up front -- every early return below hands it back, since
     # none of them reached the model.
-    limited = reserve_send(user_id)
+    limited = chat_guard.reserve_send(user_id)
     if limited:
         return limited
 
@@ -117,21 +181,21 @@ def chat():
         # is indistinguishable from one that does not exist -- both are "not found".
         status = chat_history.get_conversation(db, conversation_id)
         if not status[0]:
-            release_send(user_id)
+            chat_guard.release_send(user_id)
             return jsonify({"success": False, "message": status[1]}), 404
         conversation = status[1]
     else:
         status = chat_history.create_conversation(db, user_id, message)
         if not status[0]:
-            release_send(user_id)
+            chat_guard.release_send(user_id)
             return jsonify({"success": False, "message": status[1]}), 500
         conversation = status[1]
         conversation_id = conversation["id"]
 
     status = chat_history.add_message(db, conversation_id, "user", message)
     if not status[0]:
-        release_send(user_id)
-        rollback_turn(db, conversation_id, None, is_new_conversation)
+        chat_guard.release_send(user_id)
+        chat_guard.rollback_turn(db, conversation_id, None, is_new_conversation)
         return jsonify({"success": False, "message": status[1]}), 500
     user_message_id = status[1]["id"]
 
@@ -139,8 +203,8 @@ def chat():
     # recent window of it, straight from the database.
     status = chat_history.get_recent_messages(db, conversation_id)
     if not status[0]:
-        release_send(user_id)
-        rollback_turn(db, conversation_id, user_message_id, is_new_conversation)
+        chat_guard.release_send(user_id)
+        chat_guard.rollback_turn(db, conversation_id, user_message_id, is_new_conversation)
         return jsonify({"success": False, "message": status[1]}), 500
     history = status[1]
 
@@ -152,8 +216,8 @@ def chat():
     # and whether the attempt actually cost money.
     if not ok:
         if not billed:
-            release_send(user_id)
-        rollback_turn(db, conversation_id, user_message_id, is_new_conversation)
+            chat_guard.release_send(user_id)
+        chat_guard.rollback_turn(db, conversation_id, user_message_id, is_new_conversation)
         return jsonify({"success": False, "message": payload}), 502
     reply = payload
 
@@ -226,21 +290,15 @@ def ai_health():
 def logout():
     user_file.logout()
 
-
-# ---------------------------------------------------------------------------
-# Expenses, budget, fees and purchase rules.
-# ---------------------------------------------------------------------------
 @app.route("/expenses", methods=["POST"])
 def expense():
-    print("expense routed")
     data = request.get_json()
     access_token = bearer_token()
 
-    if(len(data) > 2):
+    if(len(data) > 2): # This is a very crude way to check if an expense or credit is being sent
         amount = data["amount"]
         purchase_date = data["purchase_date"]
         category = data["category"]
-        print(access_token)
         status = expenses.report_expense(access_token, amount, purchase_date, category)
     else:
         amount = data["amount"]
@@ -252,5 +310,117 @@ def expense():
         "message": status[1]
     })
 
+
+
+@app.route("/budget", methods=["GET"])
+def get_budget():
+
+    access_token = bearer_token()
+
+    success, expenses_data = expenses.get_expenses(access_token)
+
+    if not success:
+        return jsonify({
+            "success": False,
+            "message": expenses_data
+        })
+
+    success, funds_data = expenses.get_balance(access_token)
+
+    if not success:
+        return jsonify({
+            "success": False,
+            "message": funds_data
+        })
+
+    checking, savings = expenses._split_funds(funds_data) # I updated the funds table and made a split funds function
+                                                          # to grab the information from each account easier
+    income = checking
+
+
+    #Updated this
+    """income = 0
+
+    if len(funds_data) > 0:
+    income = float(funds_data[0]["amount"])"""
+
+    # This user info from the _split_funds helper function since I updated
+    summary = budget.calculate_budget(income, expenses_data)
+
+    summary["Savings"] = savings #Regrabbing savings using _split_funds function
+
+    warnings = budget.evaluate_budget(summary)
+
+    return jsonify({
+        "success": True,
+        "budget": summary,
+        "warnings": warnings
+    })
+
+
+@app.route("/fees", methods=["GET"])
+def get_fee_warnings():
+
+    access_token = bearer_token()
+
+    success, fees = fee_monitor.get_fees(access_token)
+
+    if not success:
+        return jsonify({
+            "success": False,
+            "message": fees
+        })
+
+    warnings = fee_monitor.check_fee_warnings(fees)
+
+    return jsonify({
+        "success": True,
+        "warnings": warnings
+    })
+
+@app.route("/purchase-rules", methods=["POST"])
+def evaluate_purchase():
+
+    data = request.get_json()
+
+    access_token = bearer_token()
+
+    success, expenses_data = expenses.get_expenses(access_token)
+
+    if not success:
+        return jsonify({
+            "success": False,
+            "message": expenses_data
+        })
+
+    success, funds_data = expenses.get_balance(access_token)
+
+    if not success:
+        return jsonify({
+            "success": False,
+            "message": funds_data
+        })
+
+    checking, _ = expenses._split_funds(funds_data)
+    income = checking
+
+    result = purchase_rules.evaluate_purchase(
+    income,
+    expenses_data,
+    float(data["amount"]),
+    data["category"]
+    )
+
+    return jsonify({
+    "success": True,
+    "result": result
+    })
+
+
 if __name__ == "__main__":
-    app.run(debug=True) #, port=5500)
+    # Backend/logs/app.log sits inside the tree the debug reloader watches, and
+    # every request writes a line to it (Werkzeug's own access log propagates to
+    # the root handler above) -- without this exclusion, every request's log
+    # write triggers a reload, which drops in-flight requests and looks to the
+    # browser like the page never finishes loading.
+    app.run(debug=True, exclude_patterns=["*/logs/*"])
