@@ -75,8 +75,7 @@ async function request(path, { method = "GET", body = null, authed = false } = {
         }
         headers["Authorization"] = `Bearer ${token}`;
     }
-console.log("API_BASE_URL:", API_BASE_URL);
-console.log("Request URL:", `${API_BASE_URL}${path}`);
+    
     try {
         const response = await fetch(`${API_BASE_URL}${path}`, {
             method,
@@ -145,6 +144,26 @@ const api = {
 
     messages(conversationId) {
         return request(`/conversations/${conversationId}/messages`, { authed: true });
+    },
+
+
+    /* POST /expenses tells an expense from a fund/credit entry by shape --
+     * amount+purchase_date+category vs amount+account -- so these stay as two
+     * named calls rather than one generic passthrough. */
+    addExpense(amount, purchaseDate, category) {
+        return request("/expenses", {
+            method: "POST",
+            authed: true,
+            body: { amount, purchase_date: purchaseDate, category },
+        });
+    },
+
+    addFund(amount, account) {
+        return request("/expenses", {
+            method: "POST",
+            authed: true,
+            body: { amount, account },
+        });
     },
 
     /* No login needed. False means the coach is misconfigured server-side, and
