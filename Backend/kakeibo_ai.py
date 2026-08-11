@@ -52,7 +52,7 @@ client = OpenAI(api_key=os.getenv("OPENAI_API_KEY") or "missing-key",
 # Extendibility note: this framework talks to the model API in exactly one
 # place (_model_call). To change models, set KAKEIBO_MODEL or pass model=...;
 # to swap providers entirely, _model_call is the only function to rewrite.
-DEFAULT_MODEL = os.getenv("KAKEIBO_MODEL", "gpt-4o")
+DEFAULT_MODEL = os.getenv("KAKEIBO_MODEL", "gpt-4o-mini")
 
 
 # ---------------------------------------------------------------------------
@@ -214,11 +214,7 @@ def _model_call(messages, *, system, model=None, max_tokens=1500,
             },
         }
 
-    try:
-        return client.chat.completions.create(**kwargs)
-    except Exception as e:
-        log.exception("MODEL CALL FAILED: %s", e)
-        raise
+    return client.chat.completions.create(**kwargs)
 
 
 def _structured_call(user_content, schema, *, model=None, max_tokens=1500,
