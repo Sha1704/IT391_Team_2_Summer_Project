@@ -516,7 +516,8 @@ def ask_coach(history, user_context=None, model=None, system=None):
 
         return (True, message.content, True)
     except Exception as e:
-        return (False, _friendly_error("ask_coach", e), _was_billed(e))
+        log.exception("ask_coach failed")
+        return (False, f"DEBUG: {type(e).__name__}: {e}", _was_billed(e))
 
 
 # ---------------------------------------------------------------------------
