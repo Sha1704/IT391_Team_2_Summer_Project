@@ -53,8 +53,7 @@ client = OpenAI(api_key=os.getenv("OPENAI_API_KEY") or "missing-key",
 # place (_model_call). To change models, set KAKEIBO_MODEL or pass model=...;
 # to swap providers entirely, _model_call is the only function to rewrite.
 DEFAULT_MODEL = os.getenv("KAKEIBO_MODEL", "gpt-4o")
-print("KAKEIBO_MODEL:", os.getenv("KAKEIBO_MODEL"))
-print("DEFAULT_MODEL:", DEFAULT_MODEL)
+
 
 # ---------------------------------------------------------------------------
 # The coach persona.
